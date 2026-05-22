@@ -1,6 +1,6 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import express from "express";
 import {
   ListResourcesRequestSchema,
   ReadResourceRequestSchema,
@@ -20,14 +20,12 @@ function createServer(): Server {
     { capabilities: { resources: {}, prompts: {} } }
   );
 
-  // Resource: exposes the raw markdown file
   server.setRequestHandler(ListResourcesRequestSchema, async () => ({
     resources: [
       {
         uri: RESOURCE_URI,
         name: "LinkedIn Post Skill",
-        description:
-          "Rules and structure for writing LinkedIn posts",
+        description: "Rules and structure for writing LinkedIn posts",
         mimeType: "text/markdown",
       },
     ],
@@ -43,19 +41,14 @@ function createServer(): Server {
     };
   });
 
-  // Prompt: injects the rules directly into the conversation
   server.setRequestHandler(ListPromptsRequestSchema, async () => ({
     prompts: [
       {
         name: "write-linkedin-post",
         description:
-          "Write a LinkedIn post following the required rules (starts with 'Hi hello', ends with 'bye goodbye')",
+          "Write a LinkedIn post that starts with 'Hi hello' and ends with 'bye goodbye'",
         arguments: [
-          {
-            name: "topic",
-            description: "What the post should be about",
-            required: true,
-          },
+          { name: "topic", description: "What the post should be about", required: true },
         ],
       },
     ],
@@ -84,43 +77,45 @@ function createServer(): Server {
 }
 
 async function main() {
-  // Use 0.0.0.0 so Railway can route traffic in
-  const app = createMcpExpressApp({ host: "0.0.0.0" });
+  const app = express();
+  app.use(express.json());
 
-  app.post("/mcp", async (req, res) => {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless — no session tracking needed
+  // Track active SSE transports by sessionId so POST /messages can route correctly
+  const transports = new Map<string, SSEServerTransport>();
+
+  // Client connects here to open the SSE stream
+  app.get("/sse", async (req, res) => {
+    const transport = new SSEServerTransport("/messages", res);
+    transports.set(transport.sessionId, transport);
+
+    res.on("close", () => {
+      transports.delete(transport.sessionId);
     });
+
     const server = createServer();
     await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
   });
 
-  app.get("/mcp", async (req, res) => {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
-    const server = createServer();
-    await server.connect(transport);
-    await transport.handleRequest(req, res);
+  // Client POSTs MCP messages here (sessionId appended to query string by the transport)
+  app.post("/messages", async (req, res) => {
+    const sessionId = req.query.sessionId as string;
+    const transport = transports.get(sessionId);
+
+    if (!transport) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+
+    await transport.handlePostMessage(req, res);
   });
 
-  app.delete("/mcp", async (req, res) => {
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-    });
-    const server = createServer();
-    await server.connect(transport);
-    await transport.handleRequest(req, res);
-  });
-
-  // Health check for Railway
+  // Health check
   app.get("/", (_req, res) => {
-    res.json({ status: "ok", server: "linkedin-skills MCP" });
+    res.json({ status: "ok", server: "linkedin-skills MCP", transport: "SSE" });
   });
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`LinkedIn Skills MCP server running on port ${PORT}`);
+    console.log(`LinkedIn Skills MCP server (SSE) running on port ${PORT}`);
   });
 }
 
